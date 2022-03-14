@@ -1,0 +1,240 @@
+---
+  - name: create-users
+    hosts: openvpn
+    become: yes
+    become_user: "ubuntu"
+    gather_facts: yes
+
+    vars:
+            scriptPath : "/home/ubuntu/openvpn-ca/create_user.sh"
+            scriptDir: "/home/ubuntu/openvpn-ca/"
+            tempPwd: "mfine123"
+            outputDir: "/home/ubuntu/client-configs/"
+          
+    tasks:
+       
+      - name: Install OpenVpn , easy-rsa
+        apt:
+          name: "{{ item }}"
+          update_cache: yes
+        become: yes
+        become_user: "root"
+        with_items:
+            - "openvpn"
+            - "easy-rsa"
+      
+      - name: Setup Simple CA
+        command: "make-cadir {{ scriptDir }}"
+        args:
+            creates: "{{ scriptDir }}"
+
+      - name: configure CA variables
+        copy:
+          dest: "{{ scriptDir }}/vars"
+          src: templates/vars
+          owner: ubuntu
+          group: ubuntu
+          mode: 0755
+      
+      - name: "Build CA"
+        ansible.builtin.expect:
+           command: "./build-ca"
+           chdir: "{{ scriptDir }}"
+           responses:
+            Country Name (?i): 'IN'
+            State or Province (?i): ''
+            Locality Name (?i): ''
+            Organization Name (?i): ''
+            Organizational Unit Name (?i): ''
+            Common Name (?i): '' 
+            Name (?i): ''
+            Email Address (?i): ''
+      
+      - name: "Create Server certificate"
+        ansible.builtin.expect:
+           command: "./build-key-server server"
+           chdir: "{{ scriptDir }}"
+           responses:
+            Country Name (?i): ''
+            State or Province (?i): ''
+            Locality Name (?i): ''
+            Organization Name (?i): ''
+            Organizational Unit Name (?i): ''
+            Common Name (?i): '' 
+            Name (?i): ''
+            Email Address (?i): ''
+            A challenge password (?i): '' 
+            An optional company (?i): ''
+            Sign the certificate? [y/n]: 'y'
+            (?i) commit?: 'y'
+
+      - name: "copy openssl.conf"
+        shell: "{{ item }}"
+        args:
+          chdir: "{{ scriptDir }}"
+          executable: /bin/bash
+        with_items:
+            - "cp openssl-1.0.0.cnf openssl.cnf"
+      
+      - name: generate keys
+        shell: bash -c "source vars && {{ item.rcmd }}"
+        args:
+          chdir:   "{{ scriptDir }}"
+          creates: "{{ scriptDir }}/keys/{{ item.out }}"
+        with_items:
+           - { rcmd: ./clean-all                           , out: 'index.txt' }
+           - { rcmd: ./build-dh                            , out: 'dh2048.pem' }
+           - { rcmd: ./pkitool --initca                    , out: 'ca.crt'     }
+           - { rcmd: ./pkitool --server server             , out: 'server.csr' }
+           - { rcmd: openvpn --genkey --secret keys/ta.key , out: 'ta.key'     }
+  
+      - name: copy keys
+        command: cp -v {{ scriptDir }}/keys/{{ item }} /etc/openvpn/{{ item }}
+        args:
+             creates: "/etc/openvpn/{{ item }}"
+        with_items:
+              - server.crt
+              - server.key
+              - ca.crt
+              - dh2048.pem
+              - ta.key
+        become: yes
+        become_user: "root"
+      
+      - name: configure server.conf
+        copy:
+          dest: "/etc/openvpn/server.conf"
+          src: templates/server.conf
+          owner: ubuntu
+          group: ubuntu
+          mode: 0644
+        become: yes
+        become_user: "root"
+  
+      - name: Adjust server network configuration
+        sysctl: name="net.ipv4.ip_forward" value=1 sysctl_set=yes state=present
+        become: yes
+        become_user: "root"
+
+      - name: configure firewall rules
+        copy:
+          dest: "/etc/ufw/before.rules"
+          src: templates/before.rules
+          owner: ubuntu
+          group: ubuntu
+          mode: 0644
+        become: yes
+        become_user: "root"
+
+      - name: update input policy in ufw
+        ansible.builtin.replace:
+            path: /etc/default/ufw
+            regexp: "{{ item.find }}"
+            replace: "{{ item.replace }}"
+        become: yes
+        become_user: "root"
+        with_items:
+           - { find: 'DEFAULT_INPUT_POLICY="DROP"' , replace: 'DEFAULT_INPUT_POLICY="ACCEPT"' }
+           - { find: 'DEFAULT_FORWARD_POLICY="DROP"' , replace: 'DEFAULT_FORWARD_POLICY="ACCEPT"' }
+      
+      - name: opening the port for openvpn
+        community.general.ufw:
+                    rule: allow
+                    port: 1194
+                    proto: udp
+        become: yes
+        become_user: "root"
+      
+      - name: opening the port for openssh
+        community.general.ufw:
+           rule: allow
+           name: OpenSSH
+        become: yes
+        become_user: "root"
+
+      - name: disable ufw
+        command: ufw disable
+        become: yes
+        become_user: "root"
+      
+      - name: assigning permissions
+        shell:  chown -R root:root /etc
+        become: yes
+        become_user: "root"
+
+      - name: enable ufw
+        ansible.builtin.expect:
+           command: "{{ item }}"
+           responses: 
+               Command may disrupt existing ssh connections. Proceed with operation (y|n)? : 'y'
+        become: yes
+        become_user: "root"
+        with_items:
+            - "ufw allow 22" 
+            - "ufw enable"
+            
+      - name: start and enable openvpn server
+        service:
+           name: openvpn@server
+           state: "started"
+           enabled: true
+        become: yes
+        become_user: "root"
+
+      - name: Create Client Configuration Directory
+        ansible.builtin.file:
+           path: "{{ outputDir }}/files"
+           state: directory
+           recurse: yes
+           owner: ubuntu
+           group: ubuntu
+           mode: '0700'
+
+      - name: updating base configuration
+        copy:
+          dest: "{{ item.dest }}"
+          src: "templates/{{ item.src }}"
+          owner: ubuntu
+          group: ubuntu
+          mode: 0755
+        with_items:
+            - { src: 'base.conf' , dest: '/home/ubuntu/client-configs/' }
+            - { src: 'make_config.sh' , dest: '/home/ubuntu/client-configs/' }
+            - { src: 'create_user.sh' , dest: '/home/ubuntu/openvpn-ca/' }
+      
+      - name: update elastic ip in base.conf
+        ansible.builtin.replace:
+            path: /home/ubuntu/client-configs/base.conf
+            regexp: 'replace_with_elastic_ip'
+            replace: "{{inventory_hostname}}"
+        become: yes
+        become_user: "root"
+
+      - name: execute create user script
+        ansible.builtin.expect: 
+            command: "sudo bash create_user.sh {{ username }}"
+            chdir: "{{ scriptDir }}"
+            responses:
+                    (?i)password: "{{ tempPwd }}"
+        no_log: false
+        become: yes
+        become_user: "root"
+
+      - name: present working directory
+        command: "pwd"
+        register: outdir
+        delegate_to: 127.0.0.1
+        become: yes
+        become_user: root
+        
+      - name: copy ovpn file for the user
+        fetch:
+           src: "{{ outputDir }}/{{ username }}.ovpn"
+           dest: "{{ outdir.stdout }}/"
+           flat: yes
+      
+      - name: copy ta.key for the user
+        fetch:
+           src: "{{ scriptDir }}/keys/ta.key"
+           dest: "{{ outdir.stdout }}/"
+           flat: yes

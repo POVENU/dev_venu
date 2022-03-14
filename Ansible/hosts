@@ -1,0 +1,2 @@
+[openvpn]
+65.0.0.198 ansible_user=ubuntu
